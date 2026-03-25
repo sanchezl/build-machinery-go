@@ -141,3 +141,105 @@ func TestUpToDateBranch(t *testing.T) {
 		t.Errorf("Expected 2 commits (C, D), got %d", len(allCommits))
 	}
 }
+
+// TestRebase simulates an OpenShift downstream rebase onto a new upstream
+// version. The upstream has two release branches that diverge from a shared
+// base. The downstream merges the old release, adds carry patches, then
+// rebases onto the new release and re-applies carries.
+//
+// In this scenario --ancestry-path is essential: without it,
+// AllCommitsBetween includes old upstream commits that don't follow the
+// UPSTREAM: convention. DirectCommitsBetween correctly returns only the
+// re-applied carry patches on the direct path from the new merge-base.
+//
+// DAG:
+//
+//	upstream-1.31:  U1 (base) --- U2 --- U3
+//	                  \                    \
+//	upstream-1.32:     --- U4 --- U5        \
+//	                               \         \
+//	downstream:                 M_new --- carry1' --- carry2' (HEAD)
+//	                               \
+//	                     (via merge, also reaches):
+//	                          carry2 --- carry1 --- U3 --- U2
+func TestRebase(t *testing.T) {
+	cleanup := initRepo(t)
+	defer cleanup()
+
+	// Build upstream release 1.31
+	git(t, "checkout", "-b", "upstream-1.31")
+	commit(t, "U1 shared base")
+	commit(t, "U2 1.31 feature")
+	commit(t, "U3 1.31 feature")
+
+	// Downstream branches from upstream-1.31 and adds carry patches
+	git(t, "checkout", "-b", "downstream")
+	commit(t, "UPSTREAM: <carry>: carry1 our patch")
+	commit(t, "UPSTREAM: <carry>: carry2 our patch")
+
+	// Upstream release 1.32 diverges from the shared base (U1)
+	git(t, "checkout", "upstream-1.31~2")
+	git(t, "checkout", "-b", "upstream-1.32")
+	commit(t, "U4 1.32 feature")
+	commit(t, "U5 1.32 feature")
+
+	// Downstream rebases onto 1.32: merge new upstream, re-apply carries
+	git(t, "checkout", "downstream")
+	git(t, "merge", "upstream-1.32", "--no-ff", "-m", "Merge upstream 1.32 rebase")
+	commit(t, "UPSTREAM: <carry>: carry1 re-applied")
+	commit(t, "UPSTREAM: <carry>: carry2 re-applied")
+
+	// The merge-base between downstream HEAD and upstream-1.32 is U5.
+	mergeBaseOut := git(t, "merge-base", "HEAD", "upstream-1.32")
+	mergeBase := mergeBaseOut[:len(mergeBaseOut)-1]
+
+	// AllCommitsBetween finds everything reachable from HEAD but not from the
+	// merge-base. This includes the re-applied carries, the old carries, AND
+	// the old upstream commits (U2, U3) reachable through the merge history.
+	// U2 and U3 don't have UPSTREAM: prefixes, so they would fail validation.
+	allCommits, err := commitchecker.AllCommitsBetween(mergeBase, "HEAD")
+	if err != nil {
+		t.Fatalf("AllCommitsBetween: %v", err)
+	}
+
+	// DirectCommitsBetween restricts to the direct ancestry path from the
+	// merge-base (U5) to HEAD. Only carry1' and carry2' are on this path.
+	directCommits, err := commitchecker.DirectCommitsBetween(mergeBase, "HEAD")
+	if err != nil {
+		t.Fatalf("DirectCommitsBetween: %v", err)
+	}
+
+	// AllCommitsBetween should find more commits than DirectCommitsBetween
+	// because it includes old upstream and carry commits via the merge.
+	if len(allCommits) <= len(directCommits) {
+		t.Errorf("Expected AllCommitsBetween to find more commits than DirectCommitsBetween, got all=%d direct=%d", len(allCommits), len(directCommits))
+	}
+
+	// DirectCommitsBetween should find exactly the 2 re-applied carries
+	if len(directCommits) != 2 {
+		t.Errorf("Expected 2 direct commits (carry1', carry2'), got %d", len(directCommits))
+		for _, c := range directCommits {
+			t.Logf("  direct: %s %s", c.Sha, c.Summary)
+		}
+	}
+
+	// All direct commits should have valid UPSTREAM: prefixes
+	for _, c := range directCommits {
+		if !c.MatchesUpstreamSummaryPattern() {
+			t.Errorf("Direct commit %s has invalid summary: %s", c.Sha, c.Summary)
+		}
+	}
+
+	// AllCommitsBetween should include commits without UPSTREAM: prefix
+	// (the old upstream commits U2, U3 reached through the merge history)
+	hasInvalidCommit := false
+	for _, c := range allCommits {
+		if !c.MatchesUpstreamSummaryPattern() && !c.MatchesMergeSummaryPattern() {
+			hasInvalidCommit = true
+			break
+		}
+	}
+	if !hasInvalidCommit {
+		t.Error("Expected AllCommitsBetween to include upstream commits without UPSTREAM: prefix")
+	}
+}
